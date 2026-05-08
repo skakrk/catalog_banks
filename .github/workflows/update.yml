@@ -25,6 +25,9 @@ jobs:
         with:
           node-version: 20
 
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
       - name: Run update script
         run: npm run update
 
@@ -37,5 +40,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add creditors.json
-          git commit -m "chore(catalog): bump version (auto)"
+          git commit -m "chore(catalog): weekly update from CBR FullCoList"
           git push

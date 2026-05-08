@@ -1,27 +1,62 @@
 #!/usr/bin/env node
-// Скрипт «tick» для каталога банков. У ЦБ нет публичного XLSX-эндпоинта
-// со списком банков (страница /banking_sector/credit/ работает через JS).
-// Поэтому каталог поддерживается вручную через PR, а скрипт:
+// Обновление каталога банков из реестра ЦБ РФ.
 //
-//   1. Валидирует JSON (структуру, обязательные поля).
-//   2. Делает легковесный sanity-check через XML_bic.asp:
-//      печатает, сколько банков из нашего seed нашлось в публичном
-//      справочнике BIC ЦБ. На основании этого редактор может вручную
-//      пометить отзывы лицензий.
-//   3. При наличии изменений — поднимает version до сегодняшней даты
-//      (с .N-суффиксом, если уже был запуск сегодня).
+// Источник: страница «Информация по кредитным организациям» (FullCoList),
+// которая внутри имеет кнопку экспорта в Excel:
+//   https://www.cbr.ru/Queries/UniDbQuery/DownloadExcel/98547
+//   ?FromDate=DD/MM/YYYY&ToDate=DD/MM/YYYY&posted=False
 //
-// Запуск:
-//   node scripts/update.mjs
+// Лист RC содержит ~1900 кредитных организаций (действующие + отозванные +
+// аннулированные + ликвидированные). В наш каталог импортируем только
+// Действующие и Отозванные — этого достаточно для пользователя.
+//
+// Колонки реестра:
+//   rn         — порядковый номер
+//   bnk_type   — тип (НКО, расчётная и т.п.; пустой = универсальный банк)
+//   cregnum    — регистрационный номер ЦБ (= лицензия)
+//   ogrn       — ОГРН (число в Excel)
+//   bnk_name   — наименование
+//   opf        — организационно-правовая форма
+//   reg_date   — дата регистрации (Excel-число дней)
+//   lic_status — Действующая | Отозванная | Аннулированная | Ликвидация
+//   bnk_addr   — адрес
+//
+// В реестре нет ИНН, поэтому для банков, которых ещё нет в каталоге,
+// ставим псевдо-ИНН вида `cbr-<cregnum>`. Когда наполнение делается через
+// PR — редактор может вручную дополнить настоящим ИНН и БИКом.
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+let XLSX;
+try {
+  XLSX = (await import('xlsx')).default;
+} catch {
+  console.error('Нужен пакет xlsx. Запустите: npm install');
+  process.exit(1);
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CATALOG_PATH = path.join(__dirname, '..', 'creditors.json');
 
-const CBR_BIC_URL = 'http://www.cbr.ru/scripts/XML_bic.asp';
+const formatCbrDate = (d) => {
+  // ЦБ ожидает MM/DD/YYYY (US-style) — проверено по странице FullCoList,
+  // hidden-форма передаёт именно такой формат.
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return `${mm}/${dd}/${d.getUTCFullYear()}`;
+};
+
+const buildCbrUrl = () => {
+  const today = formatCbrDate(new Date());
+  const params = new URLSearchParams({
+    FromDate: today,
+    ToDate: today,
+    posted: 'False',
+  });
+  return `https://www.cbr.ru/Queries/UniDbQuery/DownloadExcel/98547?${params.toString()}`;
+};
 
 const todayIso = () => new Date().toISOString();
 const todayVersion = () => {
@@ -29,35 +64,51 @@ const todayVersion = () => {
   return `${d.getUTCFullYear()}.${String(d.getUTCMonth() + 1).padStart(2, '0')}.${String(d.getUTCDate()).padStart(2, '0')}`;
 };
 
-async function fetchBicSet() {
-  try {
-    const res = await fetch(CBR_BIC_URL);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const buf = Buffer.from(await res.arrayBuffer());
-    const text = new TextDecoder('windows-1251').decode(buf);
-    const set = new Set();
-    const re = /<Bic>([^<]+)<\/Bic>/g;
-    let m;
-    while ((m = re.exec(text)) !== null) set.add(m[1].trim());
-    return set;
-  } catch (e) {
-    console.warn(`⚠ Не удалось скачать BIC справочник: ${e.message ?? e}`);
-    return null;
-  }
+async function downloadXlsx() {
+  const url = buildCbrUrl();
+  console.log(`→ Скачиваю реестр: ${url}`);
+  const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 catalog_banks updater' } });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  console.log(`  получено ${buf.length} байт`);
+  return buf;
 }
 
-function validate(data) {
-  const errors = [];
-  if (!data.version) errors.push('отсутствует поле version');
-  if (!Array.isArray(data.creditors)) errors.push('creditors не массив');
-  for (const [i, c] of (data.creditors ?? []).entries()) {
-    if (!c.inn) errors.push(`#${i}: нет inn`);
-    if (!c.name) errors.push(`#${i}: нет name`);
-    if (!['active', 'suspended', 'revoked', 'unknown'].includes(c.licenseStatus)) {
-      errors.push(`#${i} (${c.name}): неизвестный licenseStatus "${c.licenseStatus}"`);
+const STATUS_MAP = {
+  'Действующая':   'active',
+  'Отозванная':    'revoked',
+  'Аннулированная':'revoked',
+  'Ликвидация':    'revoked',
+};
+
+function parseRegistry(buf) {
+  const wb = XLSX.read(buf, { type: 'buffer' });
+  const sheet = wb.Sheets['RC'] ?? wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(sheet, { defval: null, raw: true });
+
+  const out = [];
+  for (const r of rows) {
+    const status = STATUS_MAP[r.lic_status];
+    if (!status) continue;                          // пустой/неизвестный статус — пропускаем
+    if (status !== 'active' && r.lic_status !== 'Отозванная') {
+      // Импортируем только Действующие и Отозванные. Аннулированные/
+      // Ликвидированные тоже становятся 'revoked' выше — но мы оставим
+      // только тех, у кого был полноценный отзыв (Отозванная). Иначе
+      // каталог раздуется на 1500 «исторических» записей.
+      continue;
     }
+    const cregnum = r.cregnum != null ? String(r.cregnum).trim() : '';
+    if (!cregnum) continue;
+    out.push({
+      cregnum,
+      name: String(r.bnk_name ?? '').trim(),
+      ogrn: r.ogrn != null ? String(r.ogrn).trim() : undefined,
+      address: r.bnk_addr ? String(r.bnk_addr).trim() : undefined,
+      bnk_type: r.bnk_type ? String(r.bnk_type).trim() : undefined,
+      licenseStatus: status,
+    });
   }
-  return errors;
+  return out;
 }
 
 async function readCurrent() {
@@ -65,52 +116,76 @@ async function readCurrent() {
   return JSON.parse(raw);
 }
 
-async function main() {
-  const current = await readCurrent();
-  console.log(`Текущая версия: ${current.version} (${current.creditors.length} записей)`);
+const PSEUDO_INN_PREFIX = 'cbr-';
 
-  // 1) Валидация
-  const errors = validate(current);
-  if (errors.length) {
-    console.error('✗ Каталог невалиден:');
-    for (const e of errors) console.error('   -', e);
-    process.exit(1);
-  }
-  console.log('✓ JSON валиден');
-
-  // 2) Sanity-check через XML_bic.asp (не отзываем автоматически — только репорт)
-  const bicSet = await fetchBicSet();
-  if (bicSet) {
-    let confirmed = 0;
-    let unconfirmed = 0;
-    const unconfirmedNames = [];
-    for (const c of current.creditors) {
-      if (c.inn === '0000000000') continue;
-      if (!c.bik) { unconfirmed++; continue; }
-      if (bicSet.has(c.bik)) confirmed++;
-      else {
-        unconfirmed++;
-        if (c.licenseStatus === 'active') {
-          unconfirmedNames.push(`${c.shortName ?? c.name} (BIC ${c.bik})`);
-        }
-      }
-    }
-    console.log(`  активных подтверждено в BIC-выборке: ${confirmed}`);
-    console.log(`  не нашли в публичной выборке:        ${unconfirmed}`);
-    if (unconfirmedNames.length) {
-      console.log('  ⓘ XML_bic.asp выдаёт ограниченную территориальную выборку,');
-      console.log('    отсутствие BIC в ней НЕ означает отзыв лицензии.');
-      console.log('    Проверьте при необходимости вручную:');
-      for (const n of unconfirmedNames.slice(0, 10)) console.log('     -', n);
-      if (unconfirmedNames.length > 10) {
-        console.log(`     … и ещё ${unconfirmedNames.length - 10}`);
-      }
-    }
+function merge(current, fromRegistry) {
+  // Индекс существующих записей по cregnum (= licenseNo) и по inn
+  const byCregnum = new Map();
+  for (const c of current.creditors) {
+    if (c.licenseNo) byCregnum.set(String(c.licenseNo), c);
   }
 
-  // 3) Bump версии (новая дата → новая версия). Редакторские правки в JSON
-  // подхватываются именно так: после ручного PR на main воркфлоу запускает
-  // скрипт, и version обновляется до текущей даты.
+  const now = todayIso();
+  const seenCregnums = new Set();
+  let added = 0;
+  let updated = 0;
+
+  for (const r of fromRegistry) {
+    seenCregnums.add(r.cregnum);
+    const existing = byCregnum.get(r.cregnum);
+    if (existing) {
+      // Обновляем поля из реестра, не трогая редакторские (ИНН, БИК,
+      // ratingScore, website, shortName).
+      existing.name = r.name || existing.name;
+      existing.ogrn = r.ogrn ?? existing.ogrn;
+      existing.address = r.address ?? existing.address;
+      const wasRevoked = existing.licenseStatus === 'revoked';
+      existing.licenseStatus = r.licenseStatus;
+      if (r.licenseStatus === 'revoked' && !wasRevoked) {
+        existing.revokedAt = now.slice(0, 10);
+      } else if (r.licenseStatus === 'active') {
+        delete existing.revokedAt;
+      }
+      existing.updatedAt = now;
+      updated++;
+    } else {
+      // Новая запись — без ИНН и БИК, с псевдо-ИНН для совместимости с
+      // приложением (которое использует ИНН как primary key).
+      const newRec = {
+        inn: `${PSEUDO_INN_PREFIX}${r.cregnum}`,
+        name: r.name,
+        ogrn: r.ogrn,
+        licenseNo: r.cregnum,
+        registryRecordNo: r.cregnum,
+        licenseStatus: r.licenseStatus,
+        address: r.address,
+        complaintsUrl: 'https://www.cbr.ru/Reception/Message/Register',
+        ratingScore: 50,
+        updatedAt: now,
+      };
+      if (r.licenseStatus === 'revoked') {
+        newRec.revokedAt = now.slice(0, 10);
+      }
+      current.creditors.push(newRec);
+      added++;
+    }
+  }
+
+  // Записи в каталоге, которых нет в реестре, но есть cregnum — отзыв
+  // лицензии на стороне ЦБ может означать, что банк выпал из выдачи.
+  // Не трогаем — оставляем последний известный статус.
+
+  // Сортировка: плейсхолдер первым, затем active, затем revoked, по name
+  current.creditors.sort((a, b) => {
+    if (a.inn === '0000000000') return -1;
+    if (b.inn === '0000000000') return 1;
+    const aActive = a.licenseStatus === 'active' ? 0 : 1;
+    const bActive = b.licenseStatus === 'active' ? 0 : 1;
+    if (aActive !== bActive) return aActive - bActive;
+    return a.name.localeCompare(b.name, 'ru');
+  });
+
+  // Версия с авто-инкрементом за день
   const today = todayVersion();
   let nextVersion = today;
   if (current.version === today) {
@@ -121,27 +196,43 @@ async function main() {
     nextVersion = `${today}.${n}`;
   }
 
-  const next = {
-    ...current,
-    version: nextVersion,
-    updatedAt: todayIso(),
+  return {
+    next: {
+      ...current,
+      version: nextVersion,
+      updatedAt: now,
+    },
+    stats: {
+      total: current.creditors.length,
+      active: current.creditors.filter((c) => c.licenseStatus === 'active').length,
+      revoked: current.creditors.filter((c) => c.licenseStatus === 'revoked').length,
+      added,
+      updated,
+    },
   };
+}
 
-  // Записываем только если что-то изменилось
-  const before = JSON.stringify(current);
-  const after = JSON.stringify(next);
-  if (before === after) {
-    console.log('  Изменений нет — пропускаем запись.');
-    return;
-  }
+async function main() {
+  const current = await readCurrent();
+  console.log(`Текущая версия: ${current.version} (${current.creditors.length} записей)`);
+
+  const buf = await downloadXlsx();
+  const fromReg = parseRegistry(buf);
+  console.log(`→ В реестре: ${fromReg.length} банков (active + revoked)`);
+
+  const { next, stats } = merge(current, fromReg);
 
   await fs.writeFile(
     CATALOG_PATH,
     JSON.stringify(next, null, 2) + '\n',
     'utf-8',
   );
+
   console.log('✓ Каталог обновлён');
-  console.log(`  Версия: ${current.version} → ${nextVersion}`);
+  console.log(`  Версия: ${next.version}`);
+  console.log(`  Всего записей: ${stats.total} (новых: ${stats.added}, обновлено: ${stats.updated})`);
+  console.log(`    действующих:  ${stats.active}`);
+  console.log(`    отозванных:   ${stats.revoked}`);
 }
 
 main().catch((e) => {
