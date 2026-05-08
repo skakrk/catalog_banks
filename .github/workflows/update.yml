@@ -39,8 +39,19 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Защита от race condition без rebase-конфликтов:
+          # 1) Сохраняем результат текущего прогона (актуальный snapshot ЦБ)
+          cp creditors.json /tmp/_new.json
+          # 2) Сбрасываем рабочее дерево на свежий remote main
+          git fetch origin main
+          git reset --hard origin/main
+          # 3) Кладём свежий результат поверх — и коммитим как новый шаг.
+          cp /tmp/_new.json creditors.json
           git add creditors.json
+          if git diff --staged --quiet; then
+            echo "После hard-reset нет изменений (remote уже актуальный)"
+            exit 0
+          fi
           git commit -m "chore(catalog): weekly update from CBR FullCoList"
-          # Защита от race condition: подтягиваем актуальный main перед push
-          git pull --rebase --autostash origin main || true
           git push
