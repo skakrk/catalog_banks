@@ -116,6 +116,92 @@ async function readCurrent() {
   return JSON.parse(raw);
 }
 
+// Парсер карточки финансовой организации с сайта ЦБ.
+// Карточка отдаётся по ОГРН и содержит ИНН, БИК, shortName, контакты.
+const FOINFO_URL = (ogrn) =>
+  `https://www.cbr.ru/finorg/foinfo/?ogrn=${encodeURIComponent(ogrn)}`;
+
+const COINFO_PAIR_RE = /<div class="coinfo_item_title[^"]*">([^<]+?)<\/div>\s*<div class="coinfo_item_text[^"]*">([\s\S]*?)<\/div>/g;
+
+const stripTags = (s) => s.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+
+async function fetchFoinfo(ogrn) {
+  try {
+    const res = await fetch(FOINFO_URL(ogrn), {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 catalog_banks updater',
+        Accept: 'text/html,application/xhtml+xml',
+      },
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+    const result = {};
+    let m;
+    COINFO_PAIR_RE.lastIndex = 0;
+    while ((m = COINFO_PAIR_RE.exec(html)) !== null) {
+      const key = stripTags(m[1]);
+      const value = stripTags(m[2]);
+      if (!value) continue;
+      switch (key) {
+        case 'ИНН': result.inn = value; break;
+        case 'БИК': result.bik = value; break;
+        case 'Сокращенное (фирменное) наименование': result.shortName = value; break;
+        case 'Полное (фирменное) наименование': result.fullName = value; break;
+        case 'Адрес в пределах места нахождения': result.address = value; break;
+        case 'Номер телефона': result.phone = value; break;
+        case 'Адрес электронной почты': result.email = value; break;
+      }
+    }
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Параллельное обогащение с ограничением concurrency. Заменяет
+// pseudo-ИНН (cbr-…) и пустые shortName/bik на реальные значения.
+async function enrich(creditors, concurrency = 6) {
+  const queue = creditors.filter(
+    (c) => c.ogrn && (c.inn?.startsWith('cbr-') || !c.bik || !c.shortName),
+  );
+  console.log(`→ Обогащаю ${queue.length} записей через ЦБ foinfo...`);
+
+  let done = 0;
+  let enriched = 0;
+  const fail = [];
+
+  const workers = Array.from({ length: concurrency }, async () => {
+    while (queue.length > 0) {
+      const c = queue.shift();
+      if (!c) break;
+      const data = await fetchFoinfo(c.ogrn);
+      done++;
+      if (data && (data.inn || data.bik || data.shortName)) {
+        // ИНН: заменяем pseudo, не трогаем настоящий
+        if (data.inn && c.inn?.startsWith('cbr-')) c.inn = data.inn;
+        if (data.bik && !c.bik) c.bik = data.bik;
+        if (data.shortName && !c.shortName) c.shortName = data.shortName;
+        if (data.address && !c.address) c.address = data.address;
+        if (data.phone && !c.phone) c.phone = data.phone;
+        if (data.email && !c.email) c.email = data.email;
+        enriched++;
+      } else {
+        fail.push(c.ogrn);
+      }
+      // вежливая пауза, чтобы не выглядеть DDoS
+      await sleep(60);
+      if (done % 50 === 0) console.log(`  обработано ${done}, обогащено ${enriched}`);
+    }
+  });
+  await Promise.all(workers);
+  console.log(`✓ Обогащение завершено: ${enriched} обновлено, ${fail.length} без данных`);
+  if (fail.length && fail.length < 10) {
+    console.log(`  без данных: ${fail.join(', ')}`);
+  }
+}
+
 const PSEUDO_INN_PREFIX = 'cbr-';
 
 function merge(current, fromRegistry) {
@@ -222,17 +308,29 @@ async function main() {
 
   const { next, stats } = merge(current, fromReg);
 
+  // Обогащение через карточку foinfo: подтягиваем ИНН, БИК, shortName,
+  // контакты для всех записей, у которых эти поля не заполнены.
+  // Если пропустить (например, нет сети) — ничего не сломается, просто
+  // pseudo-ИНН останутся.
+  await enrich(next.creditors, 6);
+
   await fs.writeFile(
     CATALOG_PATH,
     JSON.stringify(next, null, 2) + '\n',
     'utf-8',
   );
 
+  // Пересчёт статистик после обогащения
+  const realInn = next.creditors.filter(
+    (c) => c.licenseStatus === 'active' && c.inn && !c.inn.startsWith('cbr-') && c.inn !== '0000000000',
+  ).length;
+
   console.log('✓ Каталог обновлён');
   console.log(`  Версия: ${next.version}`);
   console.log(`  Всего записей: ${stats.total} (новых: ${stats.added}, обновлено: ${stats.updated})`);
-  console.log(`    действующих:  ${stats.active}`);
-  console.log(`    отозванных:   ${stats.revoked}`);
+  console.log(`    действующих:    ${stats.active}`);
+  console.log(`    с настоящим ИНН: ${realInn}`);
+  console.log(`    отозванных:     ${stats.revoked}`);
 }
 
 main().catch((e) => {
