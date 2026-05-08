@@ -1,0 +1,41 @@
+name: Update catalog
+
+on:
+  schedule:
+    # Каждый понедельник в 06:00 UTC
+    - cron: '0 6 * * 1'
+  # При каждом push в main — sanity-check и bump версии при ручных правках
+  push:
+    branches: [main]
+    paths: ['creditors.json']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run update script
+        run: npm run update
+
+      - name: Commit and push if changed
+        run: |
+          if git diff --quiet creditors.json; then
+            echo "Каталог не изменился — нечего коммитить"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add creditors.json
+          git commit -m "chore(catalog): bump version (auto)"
+          git push

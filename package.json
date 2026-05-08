@@ -1,0 +1,11 @@
+{
+  "name": "catalog-banks",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "JSON-справочник банков РФ из реестра ЦБ РФ",
+  "license": "MIT",
+  "scripts": {
+    "update": "node scripts/update.mjs"
+  }
+}
