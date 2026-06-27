@@ -271,16 +271,8 @@ function merge(current, fromRegistry) {
     return a.name.localeCompare(b.name, 'ru');
   });
 
-  // Версия с авто-инкрементом за день
-  const today = todayVersion();
-  let nextVersion = today;
-  if (current.version === today) {
-    nextVersion = `${today}.1`;
-  } else if (current.version.startsWith(`${today}.`)) {
-    const m = /\.(\d+)$/.exec(current.version);
-    const n = m ? Number(m[1]) + 1 : 1;
-    nextVersion = `${today}.${n}`;
-  }
+  // Версия = дата обновления. Патч-суффикс не нужен — ЦБ обновляет раз в день.
+  const nextVersion = todayVersion();
 
   return {
     next: {
